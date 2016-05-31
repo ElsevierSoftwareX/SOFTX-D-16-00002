@@ -1,0 +1,193 @@
+classdef oidSpectrumFDP < oidSpectrum
+   % Class for Finite Dimensional Spectrum Parameterizations
+   properties
+      input
+      output
+   end
+   properties (Dependent = true)
+      M;          % Number of parameters
+   end
+   properties (Hidden = true)
+      parameters; % Spectrum parameters
+   end
+   properties (Dependent = true, Hidden = true)
+      n;          % Input dimensions
+   end
+   methods (Abstract)
+      [A,B,C,D] = ss(obj);
+      BkP = informationMatrixBasis(obj);
+   end
+   methods
+      function obj = oidSpectrumFDP(type,M,n)
+         obj = obj@oidSpectrum(type);
+         obj.parameters = sdpvar(n,n,M);
+         obj.input = struct('lb',zeros(n), 'ub',[], 'power',[]);
+         obj.output = struct('lb',zeros(n), 'ub',[], 'power',[]);
+      end
+
+      function con = getConstraints(obj,problem)
+         % KYP for spectrum
+         [A,B,C,D] = obj.ss();
+         
+         % Lower bound input spectrum
+         Q = sdpvar(size(A,2),size(A,2),'symmetric');
+         con = [[Q-A'*Q*A  C'-A'*Q*B;
+            C-B'*Q*A  D+D'-obj.input.lb-B'*Q*B] >= 0; Q >= 0];
+         
+         % Upper bound input spectrum
+         if ~isempty(obj.input.ub)
+            % Sample LTI constraint
+            if isa(obj.input.ub,'lti')
+               [Bw,w] = freqresp(obj.input.ub,...
+                  linspace(1e-3,pi)./problem.model.Ts);
+               Bw = real(Bw);
+            else
+               Bw = real(obj.input.ub.B);
+               w = obj.input.ub.w;
+            end
+            for k = 1:length(w);
+               Pw = C*((exp(1i*w(k)*problem.model.Ts)*...
+                  eye(size(A)) - A)\eye(size(A)))*B + D;
+               Pw = real(Pw+Pw');
+               con = [con; Bw(:,:,k)-Pw >= 0];
+            end
+         end
+         
+         % Bound input power
+         if ~isempty(obj.input.power)
+            con = [con; obj.inputPower <= obj.input.power];
+         end
+         
+         % Bound output power
+         if ~isempty(obj.output.power)
+            con = [con; obj.outputPower(problem) <= obj.output.power];
+         end
+      end 
+      
+       
+      function iF = informationMatrix(obj,prob)
+         n = nparams(prob.model,'free');
+         [p,m] = size(prob.model);
+         
+         [G,H] = prob.modelTF();
+         [dG,dH] = prob.modelGradient();
+         
+         % Fixed controller or open loop
+         if ~prob.controller.free
+            Fy    = prob.controller.K;
+            Hinv  = eye(p)/H;
+            Su    = eye(m)/(eye(m) - Fy*G);
+            Li    = eye(p)/prob.model.NoiseVariance;
+            % Construct Gamma_r and Gamma_e
+            Gr = tf(zeros(n,p*m));
+            Ge = tf(zeros(n,p*p));
+            for i = 1:n
+               Gr(i,:) = oidProblem.vecTF(minreal(Hinv*dG{i}*Su).').';
+               Ge(i,:) = oidProblem.vecTF(minreal(Hinv*(dH{i}-dG{i}*Su*Fy*H)).').';
+            end
+            
+            % Noise contribution
+            Fe = covar(Ge,chol(kron(Li,prob.model.NoiseVariance)));
+            
+            % Reference contribution
+            Rr = oidProblem.acf(oidProblem.vecTF(Gr),obj.M);
+            CC = sdpvar((p*m)^2*(2*obj.M-1),1);
+            RR = zeros(n^2,(m*p)^2*(2*obj.M-1));
+            
+            % C_0 (DC component)
+            CC(1:(p*m)^2,:) = vec(kron(Li,obj.parameters(:,:,1)));
+            for j = 1:(p*m)
+               for k = 1:n
+                  RR(1+(k-1)*n:k*n,1+(j-1)*(m*p):j*m*p) = ...
+                     reshape(Rr(:,k+(j-1)*n,1),n,p*m);
+               end
+            end
+            
+            % C_k, k = 1,...,M 
+            for i = 1:obj.M-1
+                RT = Rr(:,:,i+1)';
+                CC(1+i*(p*m)^2:(i+1)*(p*m)^2,:) = vec(...
+                   kron(Li,obj.parameters(:,:,i+1)));
+                CC(1+(obj.M+i-1)*(p*m)^2:(i+obj.M)*(p*m)^2,:) = vec(...
+                   kron(Li,obj.parameters(:,:,i+1)'));
+                for j = 1:(p*m)
+                    for k = 1:n
+                        RR(1+(k-1)*n:k*n,1+(j-1)*(m*p)+i*(m*p)^2:j*m*p+i*(m*p)^2)=...
+                            reshape(Rr(:,k+(j-1)*n,i+1),n,p*m);
+                        RR(1+(k-1)*n:k*n,1+(j-1)*(m*p)+(obj.M+i-1)*(m*p)^2:j*m*p+(i+obj.M-1)*(m*p)^2)=...
+                            reshape(RT(:,k+(j-1)*n),n,p*m);
+                    end
+                end
+            end
+            Fr = reshape(RR*CC,n,n);
+            
+            % Total per sample information.
+            iF = Fr + Fe;
+         else
+            error('Finite dimensional spectra currently only handle the fixed controller case');
+         end
+      end
+      
+      function M = get.M(obj)
+         sz = size(obj.parameters);
+         if numel(sz) == 3
+            M = sz(3);
+         else
+            M = 1;
+         end
+      end
+      function n = get.n(obj)
+         n = size(obj.parameters,1);
+      end
+      
+      function obj = set.M(obj,M)
+         if isnumeric(M) && M > 0
+            obj.parameters = sdpvar(obj.n,obj.n,M);
+         end
+      end
+      function obj = set.n(obj,n)
+         if isnumeric(n) && n > 1
+            obj.parameters = sdpvar(n,n,obj.M);
+         end
+      end
+      function obj = set.input(obj,input)
+         % Check spectrum lower bound.
+         if isreal(input.lb) && size(input.lb,1) == size(input.lb,2) &&...
+               size(input.lb,1) == obj.n && min(eig(input.lb)) >= 0
+            obj.input.lb = input.lb;
+         else
+            throw(MException('','VerifySpectrumConstraint:IncompatibleSpectrumConstraint'));
+         end
+         
+         % Check spectrum upper bound
+         if isa(input.ub,'lti') && size(input.ub,1) == size(input.ub,2) &&...
+               size(input.ub,1) == obj.n
+            obj.input.ub = input.ub;
+         elseif isreal(input.ub) && size(input.ub,1) == size(input.ub,2) &&...
+               size(input.ub,1) == obj.n && min(eig(input.ub)) >= 0
+            obj.input.ub = input.ub;
+         elseif  isfield(input.ub,'B') && isfield(input.ub,'w')
+            obj.input.ub.B = input.ub.B;
+            obj.input.ub.w = input.ub.w;
+         elseif isempty(input.ub) || isinf(input.ub)
+            obj.input.ub = [];
+         else
+            throw(MException('','VerifySpectrumConstraint:IncompatibleSpectrumConstraint'));
+         end
+         
+         % Check that power constraint is real, scalar and positive.
+         if isempty(input.power)
+            obj.input.power = [];
+         elseif isreal(input.power) && numel(input.power) == 1 && input.power >= 0
+            % Infinite upper bound treated as empty constraint
+            if isinf(input.power)
+               obj.input.power = [];
+            else
+               obj.input.power = input.power;
+            end
+         else
+            throw(MException('','VerifySpectrumConstraint:IncompatiblePowerConstraint'));
+         end
+      end
+   end
+end
